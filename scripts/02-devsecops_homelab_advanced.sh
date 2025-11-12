@@ -30,14 +30,38 @@ if docker ps -a | grep -q 'jenkins-lts'; then
 	docker rm jenkins-lts
 fi
 
+DOCKER_GID=$(getent group docker | cut -d: -f3)
+
+cat <<EOF > Dockerfile.jenkins
+FROM jenkins/jenkins:lts
+USER root
+RUN apt-get update && \
+    apt-get install -y ca-certificates curl && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+      \$(. /etc/os-release && echo "\$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+    apt-get update && \
+    apt-get install -y docker-ce-cli
+RUN jenkins-plugin-cli --plugins docker-pipeline workflow-aggregator
+USER jenkins
+EOF
+
+docker build -t my-jenkins-dood:lts -f Dockerfile.jenkins .
+
 docker run -d \
 	--name jenkins-lts \
 	--restart=unless-stopped \
 	-p 8080:8080 \
 	-p 50000:50000 \
+	--group-add $DOCKER_GID \
 	-v jenkins_data:/var/jenkins_home \
 	-v /var/run/docker.sock:/var/run/docker.sock \
-	jenkins/jenkins:lts
+	my-jenkins-dood:lts
+
+rm Dockerfile.jenkins
 
 echo "--- [4/10] Installing Trivy and Terraform ---"
 sudo apt-get install -y wget apt-transport-https gnupg lsb-release
@@ -52,46 +76,46 @@ sudo apt install -y terraform
 
 echo "--- [5/10] Deploying HashiCorp Vault ---"
 if ! docker volume ls | grep -q vault_data; then
-    docker volume create vault_data
+    docker volume create vault_data
 fi
 
 if docker ps -a | grep -q 'vault-dev'; then
 	docker stop vault-dev
-    docker rm vault-dev
+    docker rm vault-dev
 fi
 docker run -d \
-    --name vault-dev \
-    --restart=unless-stopped \
-    -p 8200:8200 \
-    -e 'VAULT_DEV_ROOT_TOKEN_ID=devsecops-token' \
-    -v vault_data:/vault/file \
-    hashicorp/vault:latest
+    --name vault-dev \
+    --restart=unless-stopped \
+    -p 8200:8200 \
+    -e 'VAULT_DEV_ROOT_TOKEN_ID=devsecops-token' \
+    -v vault_data:/vault/file \
+    hashicorp/vault:latest
 
 echo "--- [6/10] Deploying OWASP ZAP (GitHub Registry) ---"
 if docker ps -a | grep -q 'owasp-zap'; then
-    docker stop owasp-zap
-    docker rm owasp-zap
+    docker stop owasp-zap
+    docker rm owasp-zap
 fi
 docker run -d \
-    --name owasp-zap \
-    --restart=unless-stopped \
-    -p 8090:8090 \
-    ghcr.io/zaproxy/zaproxy:stable zap.sh -daemon -port 8090 -config api.disablekey=true -host 0.0.0.0
+    --name owasp-zap \
+    --restart=unless-stopped \
+    -p 8090:8090 \
+    ghcr.io/zaproxy/zaproxy:stable zap.sh -daemon -port 8090 -config api.disablekey=true -host 0.0.0.0
 
 echo "--- [7/10] Deploying SonarQube ---"
 if ! docker volume ls | grep -q sonarqube_data; then
-    docker volume create sonarqube_data
+    docker volume create sonarqube_data
 fi
 if docker ps -a | grep -q 'sonarqube'; then
 	docker stop sonarqube
-    docker rm sonarqube
+    docker rm sonarqube
 fi
 docker run -d \
-    --name sonarqube \
-    --restart=unless-stopped \
-    -p 9000:9000 \
-    -v sonarqube_data:/opt/sonarqube/data \
-    sonarqube:lts-community
+    --name sonarqube \
+    --restart=unless-stopped \
+    -p 9000:9000 \
+    -v sonarqube_data:/opt/sonarqube/data \
+    sonarqube:lts-community
 
 echo "--- [8/10] Deploying Prometheus and Grafana ---"
 if docker ps -a | grep -q 'prometheus'; then docker stop prometheus; docker rm prometheus; fi
@@ -105,16 +129,16 @@ apt-get install -y dkms linux-headers-$(uname -r)
 echo "--- [10/10] Deploying Falco ---"
 if docker ps -a | grep -q 'falco'; then docker stop falco; docker rm falco; fi
 docker run -d \
-    --name falco \
-    --privileged \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /dev:/dev \
-    -v /proc:/host/proc:ro \
-    -v /boot:/host/boot:ro \
-    -v /lib/modules:/lib/modules:ro \
-    -v /usr:/host/usr:ro \
-    -v /etc:/host/etc:ro \
-    falcosecurity/falco:latest
+    --name falco \
+    --privileged \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /dev:/dev \
+  	-v /proc:/host/proc:ro \
+  	-v /boot:/host/boot:ro \
+  	-v /lib/modules:/lib/modules:ro \
+  	-v /usr:/host/usr:ro \
+  	-v /etc:/host/etc:ro \
+  	falcosecurity/falco:latest
 
 echo " "
 echo "--- DevSecOps Homelab Setup Complete ---"
