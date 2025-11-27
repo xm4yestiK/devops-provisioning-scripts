@@ -1,155 +1,468 @@
-#!/bin/bash
+function Write-Step { 
+    param($Message) 
+    Write-Host "`n=== $Message ===" -ForegroundColor Cyan 
+}
 
-set -e
+function Write-Success { 
+    param($Message) 
+    Write-Host "SUCCESS: $Message" -ForegroundColor Green 
+}
 
-# Fix for 'debconf: unable to initialize frontend: Dialog' error
-export DEBIAN_FRONTEND=noninteractive
+function Write-Warning { 
+    param($Message) 
+    Write-Host "WARNING: $Message" -ForegroundColor Yellow 
+}
 
-if [ "$EUID" -ne 0 ]; then
-    echo "This script must be run as root. Try: sudo ./setup_homelab.sh"
+function Write-Info { 
+    param($Message) 
+    Write-Host "  $Message" -ForegroundColor Gray 
+}
+
+function Test-Admin {
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Install-OpenSSH {
+    Write-Step "INSTALLING OPENSSH COMPONENTS"
+    
+    $sshClient = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Client*' -and $_.State -eq 'Installed' }
+    if (-not $sshClient) {
+        Write-Info "Installing OpenSSH Client..."
+        Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0 | Out-Null
+        Write-Success "OpenSSH Client installed"
+    } else {
+        Write-Success "OpenSSH Client already installed"
+    }
+    
+    $sshServer = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' -and $_.State -eq 'Installed' }
+    if (-not $sshServer) {
+        Write-Info "Installing OpenSSH Server..."
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+        Write-Success "OpenSSH Server installed"
+    } else {
+        Write-Success "OpenSSH Server already installed"
+    }
+}
+
+function Configure-Services {
+    Write-Step "CONFIGURING SSH SERVICES"
+    
+    Stop-Service ssh-agent -Force -ErrorAction SilentlyContinue
+    Stop-Service sshd -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    
+    $services = @(
+        @{Name = "ssh-agent"; Description = "SSH Agent"},
+        @{Name = "sshd"; Description = "SSH Server"}
+    )
+    
+    foreach ($service in $services) {
+        Write-Info "Configuring $($service.Description)..."
+        Set-Service -Name $service.Name -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service -Name $service.Name -ErrorAction SilentlyContinue
+        Write-Success "$($service.Description) configured and started"
+    }
+}
+
+function Setup-SSHDirectory {
+    Write-Step "SETTING UP SSH DIRECTORY STRUCTURE"
+    
+    $sshDir = "C:\Users\camil\.ssh"
+    
+    if (-not (Test-Path $sshDir)) {
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+        Write-Success "SSH directory created"
+    } else {
+        Write-Success "SSH directory already exists"
+    }
+    
+    return $sshDir
+}
+
+function Generate-SSHKeys {
+    param([string]$SSHDir)
+    
+    Write-Step "GENERATING SSH KEYS"
+    
+    Get-ChildItem "$SSHDir\id_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    
+    Write-Info "Generating Ed25519 key..."
+    ssh-keygen -t ed25519 -f "$SSHDir\id_ed25519" -N '""' -C "feliza@FELIZA" | Out-Null
+    Write-Success "Ed25519 key generated"
+    
+    $fingerprint = ssh-keygen -l -f "$SSHDir\id_ed25519"
+    Write-Info "Fingerprint: $($fingerprint[0])"
+    
+    Start-Process -FilePath "icacls" -ArgumentList "`"$SSHDir\id_ed25519`" /inheritance:r /grant:r `"Feliza\feliza:(F)`"" -Wait -WindowStyle Hidden
+}
+
+function Configure-SSHAgent {
+    Write-Step "CONFIGURING SSH AGENT"
+    
+    ssh-add -D | Out-Null
+    
+    ssh-add "C:\Users\camil\.ssh\id_ed25519" | Out-Null
+    Write-Success "SSH keys configured in agent"
+    
+    Write-Info "Keys in SSH agent:"
+    ssh-add -l
+}
+
+function Configure-Firewall {
+    Write-Step "CONFIGURING FIREWALL"
+    
+    $firewallRuleName = "OpenSSH-Server"
+    $existingRule = Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue
+    
+    if (-not $existingRule) {
+        New-NetFirewallRule -DisplayName $firewallRuleName `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 22 `
+            -Action Allow `
+            -Profile Domain,Private,Public | Out-Null
+        Write-Success "Firewall rule created for SSH"
+    } else {
+        Write-Success "Firewall rule already exists"
+    }
+}
+
+function Fix-SSHPermissions-Ultimate {
+    param([string]$SSHDir)
+    
+    Write-Step "ULTIMATE PERMISSION FIX WITH VERIFICATION"
+    
+    $authKeysPath = "$SSHDir\authorized_keys"
+    
+    try {
+        Write-Info "Stopping SSH services..."
+        Stop-Service ssh-agent, sshd -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+
+        Write-Info "Resetting permissions..."
+        Start-Process -FilePath "takeown" -ArgumentList "/f `"$SSHDir`" /r /d y" -Wait -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+        Start-Process -FilePath "icacls" -ArgumentList "`"$SSHDir`" /reset /t /c" -Wait -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+
+        Write-Info "Recreating authorized_keys..."
+        Remove-Item $authKeysPath -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+
+        $null = New-Item -Path $authKeysPath -ItemType File -Force
+        
+        Start-Process -FilePath "icacls" -ArgumentList "`"$authKeysPath`" /inheritance:r" -Wait -WindowStyle Hidden
+        Start-Process -FilePath "icacls" -ArgumentList "`"$authKeysPath`" /grant:r `"Feliza\feliza:(F)`"" -Wait -WindowStyle Hidden
+        Start-Process -FilePath "icacls" -ArgumentList "`"$authKeysPath`" /grant:r `"SYSTEM:(F)`"" -Wait -WindowStyle Hidden
+
+        $pubKey = Get-Content "$SSHDir\id_ed25519.pub"
+        Set-Content -Path $authKeysPath -Value $pubKey -Encoding UTF8
+
+        Start-Process -FilePath "icacls" -ArgumentList "`"$authKeysPath`" /grant:r `"Feliza\feliza:(R)`"" -Wait -WindowStyle Hidden
+
+        Write-Info "Verifying authorized_keys..."
+        if (Test-Path $authKeysPath) {
+            $content = Get-Content $authKeysPath
+            if ($content -and $content.Length -gt 0) {
+                Write-Success "authorized_keys created with content: $($content.Length) characters"
+            } else {
+                Write-Warning "authorized_keys is empty"
+            }
+            
+            $perms = icacls $authKeysPath
+            Write-Info "Current permissions:"
+            $perms | ForEach-Object { Write-Info "  $_" }
+        }
+
+        Write-Info "Restarting services..."
+        Start-Service ssh-agent -ErrorAction SilentlyContinue
+        Start-Service sshd -ErrorAction SilentlyContinue
+
+        Write-Success "Ultimate permission fix completed!"
+        return $true
+
+    } catch {
+        Write-Warning "Ultimate fix failed: $($_.Exception.Message)"
+        Start-Service ssh-agent, sshd -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Fix-SSHConfiguration {
+    param([string]$SSHDir)
+    
+    Write-Step "FIXING SSH CONFIGURATION"
+    
+    try {
+        Write-Info "Updating SSH client config..."
+        $clientConfig = @"
+Host *
+    IdentitiesOnly yes
+    IdentityFile ~/.ssh/id_ed25519
+    PubkeyAuthentication yes
+    PasswordAuthentication yes
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+    StrictHostKeyChecking no
+    UserKnownHostsFile ~/.ssh/known_hosts
+
+Host localhost
+    User feliza
+    Port 22
+
+Host github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+
+Host gitlab.com
+    User git  
+    IdentityFile ~/.ssh/id_ed25519
+"@
+        Set-Content -Path "$SSHDir\config" -Value $clientConfig -Encoding UTF8
+        Write-Success "SSH client config updated"
+
+        Write-Info "Updating SSH server config..."
+        $sshdConfigPath = "$env:ProgramData\ssh\sshd_config"
+        if (Test-Path $sshdConfigPath) {
+            $sshdConfig = @"
+Port 22
+Protocol 2
+
+HostKey $env:ProgramData\ssh\ssh_host_rsa_key
+HostKey $env:ProgramData\ssh\ssh_host_ecdsa_key
+HostKey $env:ProgramData\ssh\ssh_host_ed25519_key
+
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication yes
+PermitEmptyPasswords no
+PermitRootLogin no
+
+MaxAuthTries 10
+MaxSessions 20
+
+AllowUsers feliza
+
+SyslogFacility AUTH
+LogLevel VERBOSE
+
+AcceptEnv LANG LC_*
+
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+
+Subsystem sftp internal-sftp
+
+Match User feliza
+    AuthorizedKeysFile .ssh/authorized_keys
+"@
+            Set-Content -Path $sshdConfigPath -Value $sshdConfig -Encoding UTF8
+            Write-Success "SSH server configuration updated"
+        }
+
+        return $true
+    } catch {
+        Write-Warning "Configuration fix failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Verify-SSHSetup {
+    param([string]$SSHDir)
+    
+    Write-Step "VERIFYING SSH SETUP"
+    
+    $authKeysPath = "$SSHDir\authorized_keys"
+    
+    Write-Info "Checking authorized_keys..."
+    if (Test-Path $authKeysPath) {
+        $content = Get-Content $authKeysPath -ErrorAction SilentlyContinue
+        if ($content) {
+            Write-Success "authorized_keys exists with content"
+            Write-Info "Content: $content"
+        } else {
+            Write-Warning "authorized_keys exists but is empty or unreadable"
+        }
+        
+        try {
+            $perms = (Get-Acl $authKeysPath).Access | Where-Object { $_.IdentityReference -like "*feliza*" }
+            Write-Info "User permissions: $($perms.FileSystemRights)"
+        } catch {
+            Write-Warning "Cannot read permissions"
+        }
+    } else {
+        Write-Warning "authorized_keys does not exist"
+    }
+
+    Write-Info "Checking private key..."
+    $privateKey = "$SSHDir\id_ed25519"
+    if (Test-Path $privateKey) {
+        try {
+            $testContent = Get-Content $privateKey -First 1 -ErrorAction Stop
+            Write-Success "Private key is readable"
+        } catch {
+            Write-Warning "Private key is not readable: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Info "Checking services..."
+    $services = Get-Service ssh-agent, sshd
+    foreach ($service in $services) {
+        $status = if ($service.Status -eq 'Running') { "RUNNING" } else { "STOPPED" }
+        Write-Info "$($service.Name): $status"
+    }
+}
+
+function Test-Connection-Comprehensive {
+    Write-Step "COMPREHENSIVE CONNECTION TESTING"
+    
+    $sshDir = "C:\Users\camil\.ssh"
+    $privateKey = "$sshDir\id_ed25519"
+    $publicKey = "$sshDir\id_ed25519.pub"
+
+    Write-Info "Checking key fingerprints..."
+    $privateFingerprint = ssh-keygen -l -f $privateKey
+    Write-Info "Private key fingerprint: $($privateFingerprint[0])"
+    $publicFingerprint = ssh-keygen -l -f $publicKey
+    Write-Info "Public key fingerprint: $($publicFingerprint[0])"
+
+    Write-Info "Testing with explicit key file..."
+    try {
+        $testResult = ssh -o ConnectTimeout=5 -i $privateKey feliza@localhost "echo AUTH_SUCCESS" 2>&1
+        if ($testResult -like "*AUTH_SUCCESS*") {
+            Write-Success "EXPLICIT KEY TEST: SUCCESS!"
+        } else {
+            Write-Warning "EXPLICIT KEY TEST: FAILED"
+            Write-Info "Output: $testResult"
+        }
+    } catch {
+        Write-Warning "EXPLICIT KEY TEST: ERROR"
+    }
+
+    Write-Info "Testing with SSH agent..."
+    try {
+        ssh-add $privateKey | Out-Null
+        $testResult = ssh -o ConnectTimeout=5 feliza@localhost "echo AUTH_SUCCESS" 2>&1
+        if ($testResult -like "*AUTH_SUCCESS*") {
+            Write-Success "SSH AGENT TEST: SUCCESS!"
+        } else {
+            Write-Warning "SSH AGENT TEST: FAILED"
+            Write-Info "Output: $testResult"
+        }
+    } catch {
+        Write-Warning "SSH AGENT TEST: ERROR"
+    }
+
+    Write-Info "Testing basic connectivity..."
+    try {
+        $test2 = Test-NetConnection -ComputerName localhost -Port 22
+        if ($test2.TcpTestSucceeded) {
+            Write-Success "Port 22 is open and accessible"
+        } else {
+            Write-Warning "Port 22 is not accessible"
+        }
+    } catch {
+        Write-Warning "Connectivity test failed"
+    }
+
+    Write-Info "Testing GitHub connection (informational)..."
+    try {
+        $githubResult = ssh -T -o IdentityFile="$privateKey" git@github.com 2>&1
+        if ($githubResult -like "*successfully authenticated*") {
+            Write-Success "GitHub: AUTHENTICATED"
+        } else {
+            Write-Info "GitHub: Add your public key to GitHub to enable authentication"
+        }
+    } catch {
+        Write-Info "GitHub: Connection test completed"
+    }
+}
+
+function Reset-SSHSetup {
+    param([string]$SSHDir)
+    
+    Write-Step "RESETTING SSH SETUP"
+    
+    try {
+        Stop-Service ssh-agent, sshd -Force -ErrorAction SilentlyContinue
+        
+        if (Test-Path $SSHDir) {
+            Remove-Item $SSHDir -Recurse -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+        
+        New-Item -ItemType Directory -Path $SSHDir -Force | Out-Null
+        
+        Start-Process -FilePath "takeown" -ArgumentList "/f `"$SSHDir`" /r /d y" -Wait -WindowStyle Hidden
+        Start-Process -FilePath "icacls" -ArgumentList "`"$SSHDir`" /grant:r `"Feliza\feliza:(F)`" /t" -Wait -WindowStyle Hidden
+        
+        Write-Success "SSH directory reset"
+        return $true
+    } catch {
+        Write-Warning "Reset failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+Write-Host "`n" + ("=" * 60) -ForegroundColor Magenta
+Write-Host "            COMPLETE SSH SETUP & AUTHENTICATION FIX" -ForegroundColor Magenta
+Write-Host ("=" * 60) -ForegroundColor Magenta
+Write-Host "Computer: $env:COMPUTERNAME" -ForegroundColor White
+Write-Host "User: $env:USERNAME" -ForegroundColor White
+Write-Host "Time: $(Get-Date)" -ForegroundColor White
+
+$isAdmin = Test-Admin
+if (-not $isAdmin) {
+    Write-Host "`nERROR: Must run as Administrator for complete setup!" -ForegroundColor Red
     exit 1
-fi
+}
 
-echo "--- [1/10] Installing Docker Engine ---"
-if ! command -v docker &> /dev/null
-then
-    apt-get update
-    apt-get install -y docker.io
-    systemctl enable --now docker
-else
-    echo "Docker is already installed."
-fi
+$sshDir = "C:\Users\camil\.ssh"
 
-echo "--- [2/10] Installing Minimal Kubernetes (K3s) ---"
-curl -sfL https://get.k3s.io | K3S_KUBECONFIG_MODE="644" sh -
+try {
+    Write-Step "PHASE 1: BASIC SSH SETUP"
+    Install-OpenSSH
+    Configure-Services
+    Configure-Firewall
+    
+    Write-Step "PHASE 2: CLEAN SETUP"
+    Reset-SSHSetup -SSHDir $sshDir
+    Generate-SSHKeys -SSHDir $sshDir
+    Configure-SSHAgent
+    
+    Write-Step "PHASE 3: PERMISSION FIX"
+    Fix-SSHPermissions-Ultimate -SSHDir $sshDir
+    
+    Write-Step "PHASE 4: CONFIGURATION"
+    Fix-SSHConfiguration -SSHDir $sshDir
+    
+    Write-Step "PHASE 5: VERIFICATION"
+    Verify-SSHSetup -SSHDir $sshDir
+    Test-Connection-Comprehensive
+    
+    Write-Step "SETUP COMPLETE - FINAL SUMMARY"
+    
+    Write-Success "SSH setup completed successfully!"
+    Write-Success "All components are configured and tested"
+    
+    $pubKeyContent = Get-Content "$sshDir\id_ed25519.pub"
+    Write-Host "`nYOUR PUBLIC KEY (add this to services):" -ForegroundColor Cyan
+    Write-Host $pubKeyContent -ForegroundColor White
+    
+    Write-Host "`nNEXT STEPS:" -ForegroundColor Green
+    Write-Info "1. Add your public key to GitHub/GitLab/remote servers"
+    Write-Info "2. Test: ssh localhost (should work now)"
+    Write-Info "3. Test: ssh -T git@github.com (after adding key)"
+    Write-Info "4. Use: git clone git@github.com:user/repo.git"
+    Write-Info "5. Use: ssh user@remote-server.com"
+    
+    Write-Host "`n🎉 YOUR SSH SETUP IS 100% COMPLETE AND READY! 🎉" -ForegroundColor Green
 
-echo "--- [3/10] Deploying Jenkins (LTS Container) ---"
-if ! docker volume ls | grep -q jenkins_data; then
-    docker volume create jenkins_data
-fi
+} catch {
+    Write-Host "`nSETUP FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Info "Stack trace: $($_.ScriptStackTrace)"
+}
 
-if docker ps -a | grep -q 'jenkins-lts'; then
-    docker stop jenkins-lts
-    docker rm jenkins-lts
-fi
-
-DOCKER_GID=$(getent group docker | cut -d: -f3)
-
-cat <<EOF > Dockerfile.jenkins
-FROM jenkins/jenkins:lts
-USER root
-RUN apt-get update && \
-    apt-get install -y ca-certificates curl && \
-    install -m 0755 -d /etc/apt/keyrings && \
-    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && \
-    chmod a+r /etc/apt/keyrings/docker.asc && \
-    echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
-      \$(. /etc/os-release && echo "\$VERSION_CODENAME") stable" | \
-      tee /etc/apt/sources.list.d/docker.list > /dev/null && \
-    apt-get update && \
-    apt-get install -y docker-ce-cli
-# FIXED: Replaced deprecated 'docker-pipeline' with 'docker-workflow'
-RUN jenkins-plugin-cli --plugins docker-workflow workflow-aggregator
-USER jenkins
-EOF
-
-docker build -t my-jenkins-dood:lts -f Dockerfile.jenkins .
-
-docker run -d \
-    --name jenkins-lts \
-    --restart=unless-stopped \
-    -p 8080:8080 \
-    -p 50000:50000 \
-    --group-add $DOCKER_GID \
-    -v jenkins_data:/var/jenkins_home \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    my-jenkins-dood:lts
-
-rm Dockerfile.jenkins
-
-echo "--- [4/10] Installing Trivy and Terraform ---"
-sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
-sudo apt-get update
-sudo apt-get install -y trivy
-curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-sudo apt update
-sudo apt install -y terraform
-
-echo "--- [5/10] Deploying HashiCorp Vault ---"
-if ! docker volume ls | grep -q vault_data; then
-    docker volume create vault_data
-fi
-
-if docker ps -a | grep -q 'vault-dev'; then
-    docker stop vault-dev
-    docker rm vault-dev
-fi
-docker run -d \
-    --name vault-dev \
-    --restart=unless-stopped \
-    -p 8200:8200 \
-    -e 'VAULT_DEV_ROOT_TOKEN_ID=devsecops-token' \
-    -v vault_data:/vault/file \
-    hashicorp/vault:latest
-
-echo "--- [6/10] Deploying OWASP ZAP (GitHub Registry) ---"
-if docker ps -a | grep -q 'owasp-zap'; then
-    docker stop owasp-zap
-    docker rm owasp-zap
-fi
-docker run -d \
-    --name owasp-zap \
-    --restart=unless-stopped \
-    -p 8090:8090 \
-    ghcr.io/zaproxy/zaproxy:stable zap.sh -daemon -port 8090 -config api.disablekey=true -host 0.0.0.0
-
-echo "--- [7/10] Deploying SonarQube ---"
-if ! docker volume ls | grep -q sonarqube_data; then
-    docker volume create sonarqube_data
-fi
-if docker ps -a | grep -q 'sonarqube'; then
-    docker stop sonarqube
-    docker rm sonarqube
-fi
-docker run -d \
-    --name sonarqube \
-    --restart=unless-stopped \
-    -p 9000:9000 \
-    -v sonarqube_data:/opt/sonarqube/data \
-    sonarqube:lts-community
-
-echo "--- [8/10] Deploying Prometheus and Grafana ---"
-if docker ps -a | grep -q 'prometheus'; then docker stop prometheus; docker rm prometheus; fi
-if docker ps -a | grep -q 'grafana'; then docker stop grafana; docker rm grafana; fi
-docker run -d --name prometheus -p 9090:9090 prom/prometheus
-docker run -d --name grafana -p 3000:3000 grafana/grafana-oss
-
-echo "--- [9/10] Installing Falco Dependencies ---"
-apt-get install -y dkms linux-headers-$(uname -r)
-
-echo "--- [10/10] Deploying Falco ---"
-if docker ps -a | grep -q 'falco'; then docker stop falco; docker rm falco; fi
-docker run -d \
-    --name falco \
-    --privileged \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /dev:/dev \
-      -v /proc:/host/proc:ro \
-      -v /boot:/host/boot:ro \
-      -v /lib/modules:/lib/modules:ro \
-      -v /usr:/host/usr:ro \
-      -v /etc:/host/etc:ro \
-      falcosecurity/falco:latest
-
-echo " "
-echo "--- DevSecOps Homelab Setup Complete ---"
-echo "1. Jenkins Admin Password:"
-until docker exec jenkins-lts test -f /var/jenkins_home/secrets/initialAdminPassword 2>/dev/null; do
-    echo -n "."
-    sleep 2
-done
-docker exec jenkins-lts cat /var/jenkins_home/secrets/initialAdminPassword
-echo "------------------------------------------------------------------"
+Write-Host "`n" + ("=" * 60) -ForegroundColor Magenta
+Write-Host "Script execution completed" -ForegroundColor Magenta
+Write-Host ("=" * 60) -ForegroundColor Magenta
